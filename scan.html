@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redirecting...</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        body {
+            background: #0B1120;
+            color: #E7ECF5;
+            font-family: 'Inter', system-ui, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .loader-box {
+            text-align: center;
+        }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #1A2440;
+            border-top: 4px solid #4FE3C1;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        h2 {
+            font-size: 18px;
+            font-weight: 500;
+            letter-spacing: 0.02em;
+        }
+    </style>
+</head>
+<body>
+    <div class="loader-box">
+        <div class="spinner" id="spinner"></div>
+        <h2 id="status">Routing connection...</h2>
+    </div>
+
+    <script>
+        (async function() {
+            "use strict";
+            // 1. Connection Configurations
+            const SUPABASE_URL = 'https://xoqshurvxfkbfkrztosx.supabase.co';
+            const SUPABASE_ANON_KEY = 'sb_publishable_qej37AZ2tVUBbLVw7zHdAA_lboXC8TN';
+            const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+            // 2. Parse URL Parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            const qrId = urlParams.get('qr_id');
+
+            const statusEl = document.getElementById('status');
+            const spinnerEl = document.getElementById('spinner');
+
+            if (!qrId) {
+                statusEl.innerText = "Error: Invalid hardware token or parameters missing.";
+                spinnerEl.style.display = 'none';
+                return;
+            }
+
+            try {
+                // 3. Look up lookup details matching the QR ID
+                const { data: qrItem, error } = await supabaseClient
+                    .from('qr_codes')
+                    .select('*')
+                    .eq('qr_id', qrId)
+                    .single();
+
+                if (error || !qrItem) {
+                    statusEl.innerText = "Activation Error: QR code profile not found.";
+                    spinnerEl.style.display = 'none';
+                    return;
+                }
+
+                // Check if the link status profile is actively paused
+                if (qrItem.status === 'paused') {
+                    statusEl.innerText = "This redirection link has been temporarily paused.";
+                    spinnerEl.style.display = 'none';
+                    return;
+                }
+
+                // 4. Update operational counter metrics (+1 scan count)
+                await supabaseClient
+                    .from('qr_codes')
+                    .update({ scan_count: (qrItem.scan_count || 0) + 1 })
+                    .eq('qr_id', qrId);
+
+                // 5. Instantly forward browser focus context 
+                window.location.replace(qrItem.target_url);
+
+            } catch (err) {
+                statusEl.innerText = "Network transmission error. Please retry.";
+                spinnerEl.style.display = 'none';
+            }
+        })();
+    </script>
+</body>
+</html>
