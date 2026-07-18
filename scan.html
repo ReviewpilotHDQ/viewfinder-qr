@@ -66,35 +66,55 @@
                 return;
             }
 
-            try {
-                // 3. Look up lookup details matching the QR ID
-                const { data: qrItem, error } = await supabaseClient
-                    .from('qr_codes')
-                    .select('*')
-                    .eq('qr_id', qrId)
-                    .single();
+            // Defense-in-depth: even though the target_url is validated at write time
+            // (admin console), never redirect to a non-http(s) URL from this public page.
+            function isValidTargetUrl(str) {
+                try {
+                    const u = new URL(str);
+                    return u.protocol === "https:" || u.protocol === "http:";
+                } catch (e) {
+                    return false;
+                }
+            }
 
-                if (error || !qrItem) {
+            try {
+                // 3. Atomically look up the target AND increment the scan counter
+                //    in a single server-side call. This uses a SECURITY DEFINER
+                //    Postgres function (scan_qr), so the anon key has NO direct
+                //    SELECT/UPDATE grant on qr_codes — the row-level lookup and the
+                //    increment both happen inside one locked, atomic transaction on
+                //    the database, which means a client can't forge/replay scan
+                //    counts by reading the value and writing back a fake one.
+                const { data, error } = await supabaseClient.rpc('scan_qr', { p_qr_id: qrId });
+
+                if (error || !data || data.length === 0) {
+                    statusEl.innerText = "Network transmission error. Please retry.";
+                    spinnerEl.style.display = 'none';
+                    return;
+                }
+
+                const result = data[0];
+
+                if (!result.found) {
                     statusEl.innerText = "Activation Error: QR code profile not found.";
                     spinnerEl.style.display = 'none';
                     return;
                 }
 
-                // Check if the link status profile is actively paused
-                if (qrItem.status === 'paused') {
+                if (result.is_paused) {
                     statusEl.innerText = "This redirection link has been temporarily paused.";
                     spinnerEl.style.display = 'none';
                     return;
                 }
 
-                // 4. Update operational counter metrics (+1 scan count)
-                await supabaseClient
-                    .from('qr_codes')
-                    .update({ scan_count: (qrItem.scan_count || 0) + 1 })
-                    .eq('qr_id', qrId);
+                if (!result.target_url || !isValidTargetUrl(result.target_url)) {
+                    statusEl.innerText = "Error: Destination link is invalid.";
+                    spinnerEl.style.display = 'none';
+                    return;
+                }
 
-                // 5. Instantly forward browser focus context 
-                window.location.replace(qrItem.target_url);
+                // 4. Instantly forward browser focus context
+                window.location.replace(result.target_url);
 
             } catch (err) {
                 statusEl.innerText = "Network transmission error. Please retry.";

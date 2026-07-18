@@ -104,7 +104,22 @@
     </style>
   </head>
   <body>
-  <div id="app">
+  <div class="overlay open" id="loginOverlay">
+    <div class="modal" style="max-width:380px;">
+      <h3>Admin Access</h3>
+      <div class="field">
+        <label>Admin Access Token</label>
+        <input id="loginTokenInput" type="password" placeholder="Enter your admin token" autocomplete="off">
+      </div>
+      <div class="hint" id="loginError" style="color:var(--danger);min-height:14px;"></div>
+      <div class="modal-foot" style="justify-content:stretch;">
+        <button class="btn btn-primary" id="loginBtn" style="width:100%;justify-content:center;">Unlock Console</button>
+      </div>
+      <div class="hint">This token is verified server-side against Supabase and is never stored in the page source. It's kept only in this browser tab's session storage.</div>
+    </div>
+  </div>
+
+  <div id="app" style="display:none;">
     <div class="sidebar">
       <div class="brand">
         <div class="mark"><span></span><span></span><span></span><span></span></div>
@@ -191,6 +206,70 @@
     let drawerId = null;
     let isPausedPending = null;
 
+    // ---------- ADMIN AUTH ----------
+    // The publishable anon key above is meant to be public (that's how Supabase's
+    // anon key works). What actually guards the data is: (1) Row Level Security on
+    // qr_codes with NO policies for anon/authenticated, so direct table reads/writes
+    // are refused outright, and (2) every mutation is routed through a Postgres
+    // RPC function that requires this admin token and verifies it server-side
+    // against a hashed secret (see the SQL script). The token itself is never
+    // hardcoded here — it's entered once per browser session and kept only in
+    // sessionStorage, not committed to source.
+    const ADMIN_TOKEN_KEY = "vf_admin_token";
+    let ADMIN_TOKEN = sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
+
+    function isAuthError(err) {
+      const msg = (err && err.message) || "";
+      return /invalid admin token/i.test(msg);
+    }
+
+    function showLogin(message) {
+      document.getElementById("app").style.display = "none";
+      document.getElementById("loginOverlay").classList.add("open");
+      document.getElementById("loginError").textContent = message || "";
+    }
+    function hideLogin() {
+      document.getElementById("loginOverlay").classList.remove("open");
+      document.getElementById("app").style.display = "flex";
+    }
+
+    document.getElementById("loginBtn").onclick = async () => {
+      const token = document.getElementById("loginTokenInput").value;
+      if (!token) { document.getElementById("loginError").textContent = "Enter your admin token."; return; }
+      const btn = document.getElementById("loginBtn");
+      btn.disabled = true; btn.textContent = "Verifying…";
+      try {
+        ADMIN_TOKEN = token;
+        await loadItems();
+        sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+        hideLogin();
+        renderAll();
+        setLiveStatus("live · synced just now", true);
+      } catch (e) {
+        ADMIN_TOKEN = "";
+        document.getElementById("loginError").textContent = isAuthError(e)
+          ? "Invalid admin token."
+          : "Couldn't reach Supabase. Check your connection.";
+      } finally {
+        btn.disabled = false; btn.textContent = "Unlock Console";
+      }
+    };
+    document.getElementById("loginTokenInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("loginBtn").click();
+    });
+
+    // Structural validation only (protocol + parseability) — this is a UX guard,
+    // not the security boundary. Prevents javascript:/data: URIs and malformed
+    // input from being registered as redirect targets.
+    function isValidTargetUrl(str) {
+      try {
+        const u = new URL(str);
+        return u.protocol === "https:" || u.protocol === "http:";
+      } catch (e) {
+        return false;
+      }
+    }
+
     function getScanRedirectUrl(qrId) {
       // Dynamically maps to your domain's scan redirect file
       const loc = window.location;
@@ -201,14 +280,15 @@
       return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(url)}`;
     }
 
-    async function loadItems(){ 
+    async function loadItems(){
+      // Reads go through admin_list_qr too — the table itself has no anon SELECT
+      // policy, so listing every code (with its live target_url) requires the
+      // same verified admin token as writes do.
       const { data, error } = await supabaseClient
-        .from('qr_codes')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
+        .rpc('admin_list_qr', { p_admin_token: ADMIN_TOKEN });
+
       if(error) throw error;
-      
+
       ITEMS = data.map(dbItem => {
         const isDynamic = dbItem.status !== 'static';
         const resolvedShortUrl = isDynamic ? getScanRedirectUrl(dbItem.qr_id) : dbItem.target_url;
@@ -355,6 +435,7 @@
       const category = document.getElementById("categoryInput").value.trim();
       
       if(!title || !targetUrl){ alert("Name and destination URL are required."); return; }
+      if(!isValidTargetUrl(targetUrl)){ alert("Destination URL must be a valid http:// or https:// address."); return; }
       if(!qrId) { qrId = 'qr_' + Math.random().toString(36).substr(2, 9); }
 
       const btn = document.getElementById("saveModal");
@@ -363,8 +444,14 @@
       try{
         const statusValue = selectedType === 'static' ? 'static' : 'assigned';
         const { error } = await supabaseClient
-          .from('qr_codes')
-          .insert([{ qr_id: qrId, title, target_url: targetUrl, category, status: statusValue }]);
+          .rpc('admin_insert_qr', {
+            p_admin_token: ADMIN_TOKEN,
+            p_qr_id: qrId,
+            p_title: title,
+            p_target_url: targetUrl,
+            p_category: category || null,
+            p_status: statusValue
+          });
 
         if(error) throw error;
         
@@ -372,7 +459,8 @@
         renderAll();
         closeModal();
       }catch(e){ 
-        alert("Couldn't save to Supabase: " + e.message); 
+        if(isAuthError(e)){ sessionStorage.removeItem(ADMIN_TOKEN_KEY); showLogin("Session expired — enter your admin token again."); }
+        else alert("Couldn't save to Supabase: " + e.message); 
       } finally{ 
         btn.disabled = false; btn.textContent = "Save"; 
       }
@@ -418,20 +506,27 @@
 
     document.getElementById("dSave").onclick = async ()=>{
       const item = getItem(drawerId);
-      const updates = {};
-      
-      if(item.type==="dynamic") updates.target_url = document.getElementById("dUrlEdit").value.trim();
-      if(isPausedPending !== null) {
-        updates.status = isPausedPending ? 'paused' : 'assigned';
+      let newTargetUrl = null;
+      let newStatus = null;
+
+      if(item.type==="dynamic"){
+        newTargetUrl = document.getElementById("dUrlEdit").value.trim();
+        if(!isValidTargetUrl(newTargetUrl)){ alert("Destination URL must be a valid http:// or https:// address."); return; }
       }
-      
+      if(isPausedPending !== null) {
+        newStatus = isPausedPending ? 'paused' : 'assigned';
+      }
+
       const btn = document.getElementById("dSave");
       btn.disabled = true; btn.textContent = "Saving…";
       try{
         const { error } = await supabaseClient
-          .from('qr_codes')
-          .update(updates)
-          .eq('qr_id', drawerId);
+          .rpc('admin_update_qr', {
+            p_admin_token: ADMIN_TOKEN,
+            p_qr_id: drawerId,
+            p_target_url: newTargetUrl,
+            p_status: newStatus
+          });
 
         if(error) throw error;
         
@@ -439,7 +534,8 @@
         renderAll();
         closeDrawer();
       }catch(e){ 
-        alert("Couldn't update resource."); 
+        if(isAuthError(e)){ sessionStorage.removeItem(ADMIN_TOKEN_KEY); showLogin("Session expired — enter your admin token again."); }
+        else alert("Couldn't update resource."); 
       } finally{ 
         btn.disabled = false; btn.textContent = "Save Changes"; 
       }
@@ -449,9 +545,7 @@
       if(!confirm("Delete this QR code permanently? Printed copies will stop working.")) return;
       try{
         const { error } = await supabaseClient
-          .from('qr_codes')
-          .delete()
-          .eq('qr_id', drawerId);
+          .rpc('admin_delete_qr', { p_admin_token: ADMIN_TOKEN, p_qr_id: drawerId });
 
         if(error) throw error;
         
@@ -459,7 +553,8 @@
         renderAll();
         closeDrawer();
       }catch(e){ 
-        alert("Couldn't remove record."); 
+        if(isAuthError(e)){ sessionStorage.removeItem(ADMIN_TOKEN_KEY); showLogin("Session expired — enter your admin token again."); }
+        else alert("Couldn't remove record."); 
       }
     };
 
@@ -477,14 +572,21 @@
       if(pollBusy) return;
       const modalOpen = document.getElementById("modalOverlay").classList.contains("open");
       const drawerOpen = document.getElementById("drawer").classList.contains("open");
-      if(modalOpen || drawerOpen) return;
+      const loginOpen = document.getElementById("loginOverlay").classList.contains("open");
+      if(modalOpen || drawerOpen || loginOpen || !ADMIN_TOKEN) return;
       pollBusy = true;
       try{
         await loadItems();
         renderAll();
         setLiveStatus("live · synced just now", true);
-      }catch(e){ 
-        setLiveStatus("live · sync issue, retrying", false); 
+      }catch(e){
+        if(isAuthError(e)){
+          sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+          ADMIN_TOKEN = "";
+          showLogin("Session expired — enter your admin token again.");
+        } else {
+          setLiveStatus("live · sync issue, retrying", false);
+        }
       } finally{ 
         pollBusy = false; 
       }
@@ -495,12 +597,23 @@
 
     // ---------- INITIALIZATION ----------
     (async function init(){
+      if(!ADMIN_TOKEN){
+        showLogin();
+        return;
+      }
       try{
         await loadItems();
+        hideLogin();
         renderAll();
       }catch(e){
-        document.getElementById("grid").innerHTML = "";
-        setLiveStatus("couldn't reach cloud server", false);
+        if(isAuthError(e)){
+          sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+          showLogin("Session expired — enter your admin token again.");
+        } else {
+          hideLogin();
+          document.getElementById("grid").innerHTML = "";
+          setLiveStatus("couldn't reach cloud server", false);
+        }
       }
     })();
   })();
